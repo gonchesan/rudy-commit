@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# rudy-commit — offline Conventional Commits message generator powered by Ollama.
+# https://www.conventionalcommits.org/en/v1.0.0/
+
+set -euo pipefail
+
+VERSION="0.1.0"
+MODEL="${RUDY_MODEL:-llama3.2:3b}"
+MAX_DIFF="${RUDY_MAX_DIFF:-8000}"
+TYPES="feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert"
+
+AUTO_YES=0
+PRINT_ONLY=0
+ADD_ALL=0
+FORCE_TYPE=""
+FORCE_SCOPE=""
+HINT=""
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+if [[ -t 2 ]]; then
+  C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YEL=$'\e[33m'; C_DIM=$'\e[2m'; C_BLD=$'\e[1m'; C_RST=$'\e[0m'
+else
+  C_RED=""; C_GRN=""; C_YEL=""; C_DIM=""; C_BLD=""; C_RST=""
+fi
+
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_RST" "$*" >&2; exit 1; }
+warn() { printf '%swarning:%s %s\n' "$C_YEL" "$C_RST" "$*" >&2; }
+info() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RST" >&2; }
+
+usage() {
+  cat <<EOF
+commit dis (rudy-commit $VERSION) — offline Conventional Commits generator (Ollama)
+
+Usage: commit dis [options]   (or: rudy-commit [options])
+
+Reads your staged changes and proposes a commit message:
+  type(scope): short description
+
+  - bullet points describing the changes
+
+Options:
+  -a              Stage all changes (git add -A) before generating
+  -y              Commit without asking for confirmation
+  -p              Only print the message to stdout (no commit)
+  -m <model>      Ollama model to use (default: $MODEL, env RUDY_MODEL)
+  -t <type>       Force the commit type ($TYPES)
+  -s <scope>      Force the commit scope
+  -h <hint>       Extra context for the model (e.g. "fixes login bug #42")
+  --help          Show this help
+  --version       Show version
+
+Environment:
+  RUDY_MODEL      Default model
+  RUDY_MAX_DIFF   Max diff characters sent to the model (default: 8000)
+EOF
+}
+
+# ── args ─────────────────────────────────────────────────────────────────────
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a) ADD_ALL=1 ;;
+    -y) AUTO_YES=1 ;;
+    -p) PRINT_ONLY=1 ;;
+    -m) [[ $# -ge 2 ]] || die "-m needs a value"; MODEL="$2"; shift ;;
+    -t) [[ $# -ge 2 ]] || die "-t needs a value"; FORCE_TYPE="$2"; shift ;;
+    -s) [[ $# -ge 2 ]] || die "-s needs a value"; FORCE_SCOPE="$2"; shift ;;
+    -h) [[ $# -ge 2 ]] || die "-h needs a value"; HINT="$2"; shift ;;
+    --help) usage; exit 0 ;;
+    --version) echo "rudy-commit $VERSION"; exit 0 ;;
+    *) die "unknown option: $1 (see: commit dis --help)" ;;
+  esac
+  shift
+done
+
+if [[ -n "$FORCE_TYPE" && ! "$FORCE_TYPE" =~ ^($TYPES)$ ]]; then
+  die "invalid type '$FORCE_TYPE'. Allowed: ${TYPES//|/, }"
+fi
+
+# ── preconditions ────────────────────────────────────────────────────────────
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
+
+command -v ollama >/dev/null 2>&1 || die "ollama not found in PATH. Install it from https://ollama.com/download and run: ollama pull $MODEL"
+
+if [[ $ADD_ALL -eq 1 ]]; then
+  git add -A
+fi
+
+if git diff --cached --quiet; then
+  die "no staged changes. Use 'git add <files>' or run with -a"
+fi
+
+model_installed() {
+  local want="$1"
+  [[ "$want" == *:* ]] || want="$want:latest"
+  ollama list 2>/dev/null | tr -d '\r' | awk 'NR>1 {print $1}' | grep -Fxq "$want"
+}
+model_installed "$MODEL" || die "model '$MODEL' is not installed. Run: ollama pull $MODEL"
+
+TMPDIR_RC="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_RC"' EXIT
+MSG_FILE="$TMPDIR_RC/COMMIT_MSG"
+
+# ── context ──────────────────────────────────────────────────────────────────
+
+EXCLUDES=(
+  ':(exclude)*.lock' ':(exclude)package-lock.json' ':(exclude)pnpm-lock.yaml'
+  ':(exclude)yarn.lock' ':(exclude)*.min.js' ':(exclude)*.min.css' ':(exclude)*.map'
+)
+
+BRANCH="$(git symbolic-ref --short -q HEAD 2>/dev/null || echo detached)"
+NAME_STATUS="$(git diff --cached --name-status)"
+STAT="$(git diff --cached --stat | tail -n 30)"
+DIFF="$(git diff --cached -U2 --no-color -- . "${EXCLUDES[@]}" || true)"
+if [[ ${#DIFF} -gt $MAX_DIFF ]]; then
+  DIFF="${DIFF:0:$MAX_DIFF}"$'\n... [diff truncated]'
+fi
+
+build_prompt() {
+  local extra="$1"
+  cat <<EOF
+You are an expert software engineer writing git commit messages.
+Write ONE commit message for the staged changes below, following Conventional Commits 1.0.0.
+
+RULES:
+- First line (header): <type>(<optional scope>): <description>
+- Allowed types: ${TYPES//|/, }
+  feat = new feature, fix = bug fix, docs = documentation only, style = formatting,
+  refactor = code change without behavior change, perf = performance, test = tests,
+  build = build system or dependencies, ci = CI config, chore = maintenance, revert = revert.
+- Scope is optional: a short lowercase noun for the affected area (module, folder, component).
+- Description: imperative mood ("add", not "added"), lowercase, no trailing period, header at most 72 characters.
+- Then ONE blank line, then a body of 2 to 6 bullet points starting with "- ".
+  Each bullet explains WHAT changed and, when clear, WHY. Be specific; mention files, functions or behavior.
+- Only if the change breaks backwards compatibility: add "!" before ":" and a final footer line
+  "BREAKING CHANGE: <explanation>" after a blank line.
+- Write everything in English.
+- Output ONLY the commit message. No code fences, no quotes, no explanations, no preamble.
+
+EXAMPLE:
+feat(auth): add token refresh on expired sessions
+
+- Add interceptor that refreshes the access token on 401 responses
+- Retry the original request once after a successful refresh
+- Store refresh token expiry in session storage
+$( [[ -n "$FORCE_TYPE" ]] && printf '\nThe type MUST be: %s\n' "$FORCE_TYPE" )$( [[ -n "$FORCE_SCOPE" ]] && printf '\nThe scope MUST be: %s\n' "$FORCE_SCOPE" )$( [[ -n "$HINT" ]] && printf '\nContext from the author: %s\n' "$HINT" )$( [[ -n "$extra" ]] && printf '\n%s\n' "$extra" )
+
+BRANCH: $BRANCH
+
+FILES (git name-status):
+$NAME_STATUS
+
+STATS:
+$STAT
+
+DIFF:
+$DIFF
+
+Commit message:
+EOF
+}
+
+# ── generation ───────────────────────────────────────────────────────────────
+
+run_model() {
+  local prompt="$1" out="$TMPDIR_RC/out" err="$TMPDIR_RC/err"
+  printf '%s' "$prompt" | ollama run "$MODEL" >"$out" 2>"$err" &
+  local pid=$! i=0 frames='|/-\'
+  if [[ -t 2 ]]; then
+    while kill -0 "$pid" 2>/dev/null; do
+      printf '\r%s Generating with %s...%s' "${frames:i++%4:1}" "$MODEL" "" >&2
+      sleep 0.15
+    done
+    printf '\r\e[K' >&2
+  fi
+  if ! wait "$pid"; then
+    cat "$err" >&2
+    die "ollama failed (is the Ollama app/service running?)"
+  fi
+  cat "$out"
+}
+
+# Strip ANSI, CR, <think> blocks, code fences and any preamble before the header.
+clean_output() {
+  sed -e 's/\r//g' -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' |
+    awk '/<think>/{skip=1} !skip{print} /<\/think>/{skip=0}' |
+    { grep -v '^[[:space:]]*```' || true; } |
+    sed -e 's/[[:space:]]*$//' |
+    awk -v re="^[\"'\`]?($TYPES)([(][^)]*[)])?!?:" '
+      !started && $0 ~ re { started=1 }
+      started { lines[++n]=$0 }
+      END {
+        while (n > 0 && lines[n] == "") n--
+        for (i=1; i<=n; i++) print lines[i]
+      }'
+}
+
+# Normalize header (forced type/scope, lowercase, no period) and wrap body to 72 cols.
+normalize() {
+  local text="$1" header body type scope bang desc
+  header="$(printf '%s\n' "$text" | head -n 1)"
+  body="$(printf '%s\n' "$text" | tail -n +2 | sed '/./,$!d')"
+
+  header="${header#[\"\'\`]}"; header="${header%[\"\'\`]}"
+  if [[ "$header" =~ ^([a-z]+)(\(([^\)]*)\))?(!)?:[[:space:]]*(.*)$ ]]; then
+    type="${BASH_REMATCH[1]}"; scope="${BASH_REMATCH[3]}"; bang="${BASH_REMATCH[4]}"; desc="${BASH_REMATCH[5]}"
+    [[ -n "$FORCE_TYPE" ]] && type="$FORCE_TYPE"
+    [[ -n "$FORCE_SCOPE" ]] && scope="$FORCE_SCOPE"
+    desc="${desc%.}"
+    desc="$(printf '%s' "${desc:0:1}" | tr '[:upper:]' '[:lower:]')${desc:1}"
+    header="$type${scope:+($scope)}$bang: $desc"
+  fi
+
+  printf '%s\n' "$header"
+  if [[ -n "$body" ]]; then
+    printf '\n'
+    printf '%s\n' "$body" | awk '
+      function wrap(line, indent,   out, w, n, i, cur) {
+        n = split(line, w, " ")
+        cur = ""
+        for (i = 1; i <= n; i++) {
+          if (cur != "" && length(cur) + 1 + length(w[i]) > 72) { print cur; cur = indent w[i] }
+          else cur = (cur == "" ? w[i] : cur " " w[i])
+        }
+        if (cur != "") print cur
+      }
+      /^[-*] / { sub(/^\* /, "- "); wrap($0, "  "); next }
+      length($0) > 72 { wrap($0, ""); next }
+      { print }'
+  fi
+}
+
+header_valid() {
+  local header
+  header="$(printf '%s\n' "$1" | head -n 1)"
+  [[ "$header" =~ ^($TYPES)(\([a-z0-9._/-]+\))?!?:\ .+$ ]] && [[ ${#header} -le 72 ]]
+}
+
+generate() {
+  local extra="${1:-}" raw msg
+  raw="$(run_model "$(build_prompt "$extra")" | clean_output)"
+  if [[ -z "$raw" ]] || ! header_valid "$(normalize "$raw")"; then
+    info "Output did not match Conventional Commits, retrying once..."
+    raw="$(run_model "$(build_prompt "$extra
+IMPORTANT: your previous answer was invalid. The FIRST line must look exactly like 'feat(scope): add something' (max 72 chars).")" | clean_output)"
+  fi
+  [[ -n "$raw" ]] || die "the model did not return a valid commit message. Try again, add a hint with -h, or use another model with -m"
+  msg="$(normalize "$raw")"
+  header_valid "$msg" || warn "header does not fully comply with Conventional Commits; review it before committing"
+  printf '%s\n' "$msg"
+}
+
+show() {
+  local line="──────────────────────────────────────────────────────────────────────"
+  printf '\n%s── Suggested commit %s%s\n' "$C_DIM" "${line:0:52}" "$C_RST" >&2
+  printf '%s%s%s\n' "$C_BLD" "$(head -n 1 "$MSG_FILE")" "$C_RST" >&2
+  tail -n +2 "$MSG_FILE" >&2
+  printf '%s%s%s\n' "$C_DIM" "${line:0:71}" "$C_RST" >&2
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+generate > "$MSG_FILE"
+
+if [[ $PRINT_ONLY -eq 1 ]]; then
+  cat "$MSG_FILE"
+  exit 0
+fi
+
+if [[ $AUTO_YES -eq 1 ]]; then
+  git commit -F "$MSG_FILE"
+  exit 0
+fi
+
+[[ -r /dev/tty ]] || die "no terminal available for confirmation; use -y or -p"
+
+while true; do
+  show
+  printf '%s[c]%sommit  %s[e]%sdit  %s[r]%segenerate  %s[q]%suit > ' \
+    "$C_GRN" "$C_RST" "$C_GRN" "$C_RST" "$C_GRN" "$C_RST" "$C_GRN" "$C_RST" >&2
+  read -r choice </dev/tty || choice="q"
+  case "${choice,,}" in
+    c|"") git commit -F "$MSG_FILE"; exit 0 ;;
+    e)    git commit -e -F "$MSG_FILE"; exit $? ;;
+    r)
+      printf 'Hint for the model (optional, Enter to skip): ' >&2
+      read -r extra </dev/tty || extra=""
+      generate "${extra:+Additional guidance from the author: $extra}" > "$MSG_FILE"
+      ;;
+    q)    info "Aborted. Nothing was committed."; exit 1 ;;
+    *)    warn "unknown option '$choice'" ;;
+  esac
+done
