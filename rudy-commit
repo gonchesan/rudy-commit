@@ -51,7 +51,7 @@ Options:
 Environment:
   RUDY_MODEL      Default model
   RUDY_MAX_DIFF   Max diff characters sent to the model (default: 8000)
-  RUDY_NO_ANIM    Set to any value to disable the loading llama
+  RUDY_NO_ANIM    Set to any value to disable the loading animation
 EOF
 }
 
@@ -163,47 +163,20 @@ EOF
 
 # ── generation ───────────────────────────────────────────────────────────────
 
-QUIPS=(
-  "Sniffing your diff"
-  "Chewing on your code"
-  "Judging your variable names"
-  "Pretending to understand that regex"
-  "Getting ready to spit out a commit"
-  "Blaming the intern"
-  "Counting your TODOs"
-  "Asking the rubber duck"
-  "Grazing through your files"
-  "Translating 'fixed stuff' into English"
-  "Looking for the semicolon you forgot"
-  "Practicing the imperative mood"
-)
+# Loader shown while the model thinks.
+LOADER_FRAMES=('𓃉𓃉𓃉' '𓃉𓃉∘' '𓃉∘°' '∘°∘' '°∘𓃉' '∘𓃉𓃉')
 
-# Rudy the llama walks, chews, blinks and wags while the model thinks.
-animate_llama() {
-  local pid="$1" t=0 h=7 start=$SECONDS q=$(( RANDOM % ${#QUIPS[@]} ))
-  local eyes mouth tail legs dots quip
-  local legs_frames=('| |    | |' '/ /    \ \' '| |    | |' '\ \    / /')
+animate_loader() {
+  local pid="$1" t=0 start=$SECONDS
   printf '\e[?25l' >&2
   while kill -0 "$pid" 2>/dev/null; do
-    (( t % 16 == 15 )) && eyes="- -" || eyes="o o"
-    (( t % 2 )) && mouth="o" || mouth="_"
-    (( t / 2 % 2 )) && tail="~" || tail="-"
-    legs="${legs_frames[t % 4]}"
-    dots="$(printf '%*s' $(( t % 4 )) '' | tr ' ' '.')"
-    quip="${QUIPS[(q + t / 15) % ${#QUIPS[@]}]}"
-    printf '%s\n' \
-      "" \
-      "          /\\/\\" \
-      "         ( $eyes)   ${C_BLD}${quip}${dots}${C_RST}" \
-      "          |  $mouth)   ${C_DIM}$(( SECONDS - start ))s · $MODEL${C_RST}" \
-      "   _______|  |" \
-      "  $tail(          |" \
-      "    $legs" | sed 's/$/\x1b[K/' >&2
-    printf '\e[%dA' "$h" >&2
-    sleep 0.25
+    printf '\r%s %sGenerating...%s %s%ss%s\e[K' \
+      "${LOADER_FRAMES[t % ${#LOADER_FRAMES[@]}]}" "$C_BLD" "$C_RST" \
+      "$C_DIM" "$(( SECONDS - start ))" "$C_RST" >&2
+    sleep 0.15
     t=$(( t + 1 ))
   done
-  printf '\e[J\e[?25h' >&2
+  printf '\r\e[K\e[?25h' >&2
 }
 
 run_model() {
@@ -211,7 +184,7 @@ run_model() {
   printf '%s' "$prompt" | ollama run "$MODEL" >"$out" 2>"$err" &
   local pid=$!
   if [[ -t 2 && -z "${RUDY_NO_ANIM:-}" ]]; then
-    animate_llama "$pid"
+    animate_loader "$pid"
   fi
   if ! wait "$pid"; then
     cat "$err" >&2

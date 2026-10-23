@@ -33,7 +33,7 @@ git add .
 commit dis
 ```
 
-While the model thinks, Rudy the llama keeps you company in the terminal. Then the command shows the suggested message and asks you what to do:
+While the model thinks you see a loader (`𓃉𓃉∘ Generating... 4s`). Then the command shows the suggested message and asks you what to do:
 
 | Key | Action |
 |-----|--------|
@@ -57,7 +57,7 @@ While the model thinks, Rudy the llama keeps you company in the terminal. Then t
 
 - `RUDY_MODEL`: default model (`llama3.2:3b`)
 - `RUDY_MAX_DIFF`: maximum number of diff characters sent to the model (`8000`, sized for the 3B model's context window)
-- `RUDY_NO_ANIM`: set it to any value to turn off the loading llama (`RUDY_NO_ANIM=1 commit dis`)
+- `RUDY_NO_ANIM`: set it to any value to turn off the loading animation (`RUDY_NO_ANIM=1 commit dis`)
 
 ## Notes
 
