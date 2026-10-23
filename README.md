@@ -3,7 +3,7 @@
 Offline commit message generator for bash. It reads your staged changes, asks a local LLM ([Ollama](https://ollama.com)) for a message, and returns it in [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/) format, in English:
 
 ```
-feat(api): add user login endpoint
+feat: add user login endpoint
 
 - Add POST /login handler in src/api/auth.js that validates credentials
   against the users table and returns a signed JWT token
@@ -33,7 +33,7 @@ git add .
 commit dis
 ```
 
-The command shows the suggested message and asks you what to do:
+While the model thinks, Rudy the llama keeps you company in the terminal. Then the command shows the suggested message and asks you what to do:
 
 | Key | Action |
 |-----|--------|
@@ -51,13 +51,13 @@ The command shows the suggested message and asks you what to do:
 | `-p` | Only print the message (for example `commit dis -p > msg.txt`) |
 | `-m <model>` | Use a different Ollama model |
 | `-t <type>` | Force the type (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`) |
-| `-s <scope>` | Force the scope |
 | `-h "<hint>"` | Give the model extra context, e.g. `-h "fixes #42"` |
 
 ### Environment variables
 
 - `RUDY_MODEL`: default model (`llama3.2:3b`)
 - `RUDY_MAX_DIFF`: maximum number of diff characters sent to the model (`8000`, sized for the 3B model's context window)
+- `RUDY_NO_ANIM`: set it to any value to turn off the loading llama (`RUDY_NO_ANIM=1 commit dis`)
 
 ## Notes
 

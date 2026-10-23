@@ -13,7 +13,6 @@ AUTO_YES=0
 PRINT_ONLY=0
 ADD_ALL=0
 FORCE_TYPE=""
-FORCE_SCOPE=""
 HINT=""
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -35,7 +34,7 @@ commit dis (rudy-commit $VERSION) — offline Conventional Commits generator (Ol
 Usage: commit dis [options]   (or: rudy-commit [options])
 
 Reads your staged changes and proposes a commit message:
-  type(scope): short description
+  type: short description
 
   - bullet points describing the changes
 
@@ -45,7 +44,6 @@ Options:
   -p              Only print the message to stdout (no commit)
   -m <model>      Ollama model to use (default: $MODEL, env RUDY_MODEL)
   -t <type>       Force the commit type ($TYPES)
-  -s <scope>      Force the commit scope
   -h <hint>       Extra context for the model (e.g. "fixes login bug #42")
   --help          Show this help
   --version       Show version
@@ -53,6 +51,7 @@ Options:
 Environment:
   RUDY_MODEL      Default model
   RUDY_MAX_DIFF   Max diff characters sent to the model (default: 8000)
+  RUDY_NO_ANIM    Set to any value to disable the loading llama
 EOF
 }
 
@@ -65,7 +64,6 @@ while [[ $# -gt 0 ]]; do
     -p) PRINT_ONLY=1 ;;
     -m) [[ $# -ge 2 ]] || die "-m needs a value"; MODEL="$2"; shift ;;
     -t) [[ $# -ge 2 ]] || die "-t needs a value"; FORCE_TYPE="$2"; shift ;;
-    -s) [[ $# -ge 2 ]] || die "-s needs a value"; FORCE_SCOPE="$2"; shift ;;
     -h) [[ $# -ge 2 ]] || die "-h needs a value"; HINT="$2"; shift ;;
     --help) usage; exit 0 ;;
     --version) echo "rudy-commit $VERSION"; exit 0 ;;
@@ -100,7 +98,8 @@ model_installed() {
 model_installed "$MODEL" || die "model '$MODEL' is not installed. Run: ollama pull $MODEL"
 
 TMPDIR_RC="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR_RC"' EXIT
+trap 'rm -rf "$TMPDIR_RC"; [[ -t 2 ]] && printf "\e[J\e[?25h" >&2' EXIT
+trap 'exit 130' INT TERM
 MSG_FILE="$TMPDIR_RC/COMMIT_MSG"
 
 # ── context ──────────────────────────────────────────────────────────────────
@@ -125,12 +124,12 @@ You are an expert software engineer writing git commit messages.
 Write ONE commit message for the staged changes below, following Conventional Commits 1.0.0.
 
 RULES:
-- First line (header): <type>(<optional scope>): <description>
+- First line (header): <type>: <description>
 - Allowed types: ${TYPES//|/, }
   feat = new feature, fix = bug fix, docs = documentation only, style = formatting,
   refactor = code change without behavior change, perf = performance, test = tests,
   build = build system or dependencies, ci = CI config, chore = maintenance, revert = revert.
-- Scope is optional: a short lowercase noun for the affected area (module, folder, component).
+- Do NOT add a scope: never put parentheses between the type and the colon.
 - Description: imperative mood ("add", not "added"), lowercase, no trailing period, header at most 72 characters.
 - Then ONE blank line, then a body of 2 to 6 bullet points starting with "- ".
   Each bullet explains WHAT changed and, when clear, WHY. Be specific; mention files, functions or behavior.
@@ -140,12 +139,12 @@ RULES:
 - Output ONLY the commit message. No code fences, no quotes, no explanations, no preamble.
 
 EXAMPLE:
-feat(auth): add token refresh on expired sessions
+feat: add token refresh on expired sessions
 
 - Add interceptor that refreshes the access token on 401 responses
 - Retry the original request once after a successful refresh
 - Store refresh token expiry in session storage
-$( [[ -n "$FORCE_TYPE" ]] && printf '\nThe type MUST be: %s\n' "$FORCE_TYPE" )$( [[ -n "$FORCE_SCOPE" ]] && printf '\nThe scope MUST be: %s\n' "$FORCE_SCOPE" )$( [[ -n "$HINT" ]] && printf '\nContext from the author: %s\n' "$HINT" )$( [[ -n "$extra" ]] && printf '\n%s\n' "$extra" )
+$( [[ -n "$FORCE_TYPE" ]] && printf '\nThe type MUST be: %s\n' "$FORCE_TYPE" )$( [[ -n "$HINT" ]] && printf '\nContext from the author: %s\n' "$HINT" )$( [[ -n "$extra" ]] && printf '\n%s\n' "$extra" )
 
 BRANCH: $BRANCH
 
@@ -164,16 +163,55 @@ EOF
 
 # ── generation ───────────────────────────────────────────────────────────────
 
+QUIPS=(
+  "Sniffing your diff"
+  "Chewing on your code"
+  "Judging your variable names"
+  "Pretending to understand that regex"
+  "Getting ready to spit out a commit"
+  "Blaming the intern"
+  "Counting your TODOs"
+  "Asking the rubber duck"
+  "Grazing through your files"
+  "Translating 'fixed stuff' into English"
+  "Looking for the semicolon you forgot"
+  "Practicing the imperative mood"
+)
+
+# Rudy the llama walks, chews, blinks and wags while the model thinks.
+animate_llama() {
+  local pid="$1" t=0 h=7 start=$SECONDS q=$(( RANDOM % ${#QUIPS[@]} ))
+  local eyes mouth tail legs dots quip
+  local legs_frames=('| |    | |' '/ /    \ \' '| |    | |' '\ \    / /')
+  printf '\e[?25l' >&2
+  while kill -0 "$pid" 2>/dev/null; do
+    (( t % 16 == 15 )) && eyes="- -" || eyes="o o"
+    (( t % 2 )) && mouth="o" || mouth="_"
+    (( t / 2 % 2 )) && tail="~" || tail="-"
+    legs="${legs_frames[t % 4]}"
+    dots="$(printf '%*s' $(( t % 4 )) '' | tr ' ' '.')"
+    quip="${QUIPS[(q + t / 15) % ${#QUIPS[@]}]}"
+    printf '%s\n' \
+      "" \
+      "          /\\/\\" \
+      "         ( $eyes)   ${C_BLD}${quip}${dots}${C_RST}" \
+      "          |  $mouth)   ${C_DIM}$(( SECONDS - start ))s · $MODEL${C_RST}" \
+      "   _______|  |" \
+      "  $tail(          |" \
+      "    $legs" | sed 's/$/\x1b[K/' >&2
+    printf '\e[%dA' "$h" >&2
+    sleep 0.25
+    t=$(( t + 1 ))
+  done
+  printf '\e[J\e[?25h' >&2
+}
+
 run_model() {
   local prompt="$1" out="$TMPDIR_RC/out" err="$TMPDIR_RC/err"
   printf '%s' "$prompt" | ollama run "$MODEL" >"$out" 2>"$err" &
-  local pid=$! i=0 frames='|/-\'
-  if [[ -t 2 ]]; then
-    while kill -0 "$pid" 2>/dev/null; do
-      printf '\r%s Generating with %s...%s' "${frames:i++%4:1}" "$MODEL" "" >&2
-      sleep 0.15
-    done
-    printf '\r\e[K' >&2
+  local pid=$!
+  if [[ -t 2 && -z "${RUDY_NO_ANIM:-}" ]]; then
+    animate_llama "$pid"
   fi
   if ! wait "$pid"; then
     cat "$err" >&2
@@ -197,20 +235,19 @@ clean_output() {
       }'
 }
 
-# Normalize header (forced type/scope, lowercase, no period) and wrap body to 72 cols.
+# Normalize header (forced type, no scope, lowercase, no period) and wrap body to 72 cols.
 normalize() {
-  local text="$1" header body type scope bang desc
+  local text="$1" header body type bang desc
   header="$(printf '%s\n' "$text" | head -n 1)"
   body="$(printf '%s\n' "$text" | tail -n +2 | sed '/./,$!d')"
 
   header="${header#[\"\'\`]}"; header="${header%[\"\'\`]}"
   if [[ "$header" =~ ^([a-z]+)(\(([^\)]*)\))?(!)?:[[:space:]]*(.*)$ ]]; then
-    type="${BASH_REMATCH[1]}"; scope="${BASH_REMATCH[3]}"; bang="${BASH_REMATCH[4]}"; desc="${BASH_REMATCH[5]}"
+    type="${BASH_REMATCH[1]}"; bang="${BASH_REMATCH[4]}"; desc="${BASH_REMATCH[5]}"
     [[ -n "$FORCE_TYPE" ]] && type="$FORCE_TYPE"
-    [[ -n "$FORCE_SCOPE" ]] && scope="$FORCE_SCOPE"
     desc="${desc%.}"
     desc="$(printf '%s' "${desc:0:1}" | tr '[:upper:]' '[:lower:]')${desc:1}"
-    header="$type${scope:+($scope)}$bang: $desc"
+    header="$type$bang: $desc"
   fi
 
   printf '%s\n' "$header"
@@ -235,7 +272,7 @@ normalize() {
 header_valid() {
   local header
   header="$(printf '%s\n' "$1" | head -n 1)"
-  [[ "$header" =~ ^($TYPES)(\([a-z0-9._/-]+\))?!?:\ .+$ ]] && [[ ${#header} -le 72 ]]
+  [[ "$header" =~ ^($TYPES)!?:\ .+$ ]] && [[ ${#header} -le 72 ]]
 }
 
 generate() {
@@ -244,7 +281,7 @@ generate() {
   if [[ -z "$raw" ]] || ! header_valid "$(normalize "$raw")"; then
     info "Output did not match Conventional Commits, retrying once..."
     raw="$(run_model "$(build_prompt "$extra
-IMPORTANT: your previous answer was invalid. The FIRST line must look exactly like 'feat(scope): add something' (max 72 chars).")" | clean_output)"
+IMPORTANT: your previous answer was invalid. The FIRST line must look exactly like 'feat: add something' (max 72 chars).")" | clean_output)"
   fi
   [[ -n "$raw" ]] || die "the model did not return a valid commit message. Try again, add a hint with -h, or use another model with -m"
   msg="$(normalize "$raw")"
